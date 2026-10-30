@@ -1,0 +1,8 @@
+/target
+
+# IDE
+.idea/
+
+# Local secrets (e.g. MONGODB_URI with credentials)
+.env
+.env.*
