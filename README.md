@@ -17,6 +17,7 @@ It exposes two resources:
 - [Configuration](#configuration)
 - [Project structure](#project-structure)
 - [Resilience and connection pool](#resilience-and-connection-pool)
+- [Rate limiting](#rate-limiting)
 - [Health endpoints](#health-endpoints)
 - [Products API (MongoDB)](#products-api-mongodb)
 - [Items API (in memory)](#items-api-in-memory)
@@ -58,8 +59,11 @@ INFO catalog_api: listening on 0.0.0.0:3000
 INFO catalog_api::db: mongodb indexes ensured
 ```
 
-The server **starts even if MongoDB is down**: `/items` and `/health` keep working, `/products`
-returns `503` until the database is reachable again, and indexes are created as soon as it comes back.
+The server **starts even if MongoDB is down**: `/items` and `/health` keep working and `/products`
+returns `503` while the database is unreachable. In the background it tries to create the indexes up to
+`MONGO_STARTUP_MAX_ATTEMPTS` times (default `10`); if MongoDB is still unreachable after that, the
+service shuts down gracefully, closes the connection pool and exits with code `1`, so the container
+orchestrator can restart it or alert instead of looping forever.
 
 Stop it with `Ctrl+C`. The server shuts down gracefully (in-flight requests finish) and then closes the MongoDB connection pool.
 
@@ -87,9 +91,14 @@ All settings are read from environment variables. Invalid values are logged and 
 | `MONGO_CONNECT_TIMEOUT_MS`          | `5000`                      | Timeout to open a TCP connection.                               |
 | `MONGO_SERVER_SELECTION_TIMEOUT_MS` | `3000`                      | How long the driver waits for an available server.              |
 | `MONGO_OP_TIMEOUT_MS`               | `5000`                      | Timeout for each attempt of a database operation.               |
+| `MONGO_STARTUP_MAX_ATTEMPTS`        | `10`                        | Attempts to reach MongoDB at startup (index creation). If all fail, the service shuts down with exit code `1`. |
 | `RETRY_MAX_ATTEMPTS`                | `3`                         | Total attempts (first try + retries) for transient errors.      |
 | `RETRY_BASE_DELAY_MS`               | `100`                       | Initial backoff delay.                                          |
 | `RETRY_MAX_DELAY_MS`                | `2000`                      | Maximum backoff delay.                                          |
+| `RATE_LIMIT_ENABLED`                | `true`                      | Enables per-client rate limiting on every route.                |
+| `RATE_LIMIT_PER_SECOND`             | `10`                        | Sustained requests per second per client (decimals allowed, e.g. `0.5`). `0` disables it. |
+| `RATE_LIMIT_BURST`                  | `20`                        | Maximum requests a client can send at once.                     |
+| `RATE_LIMIT_TRUST_PROXY`            | `false`                     | Identify clients by the first `X-Forwarded-For` address. Only enable behind a trusted proxy. |
 | `RUST_LOG`                          | `info,mongodb=warn`         | Log filter (e.g. `debug`, `catalog_api=debug`).                    |
 
 Example:
@@ -111,6 +120,7 @@ src/
 ├── main.rs      # Startup, routing, health endpoints, graceful shutdown
 ├── config.rs    # Environment-based configuration
 ├── db.rs        # MongoDB client + connection pool, ping, index creation
+├── ratelimit.rs # Per-client-IP rate limiting middleware (token bucket)
 ├── retry.rs     # Retry policy: transient error detection, timeouts, backoff
 ├── error.rs     # AppError -> HTTP status + JSON body
 ├── products.rs  # /products handlers (MongoDB, paginated)
@@ -159,9 +169,12 @@ Retries are safe because all operations are idempotent:
 ### Graceful degradation
 
 - The server starts even if MongoDB is down; the driver connects lazily.
-- Indexes (`sku` unique, `category + created_at`) are created by a background task that keeps
-  retrying until MongoDB is reachable.
-- During an outage `/products` returns `503` with a `Retry-After: 5` header, while `/items` and
+- Indexes (`sku` unique, `category + created_at`) are created by a background task that retries
+  up to `MONGO_STARTUP_MAX_ATTEMPTS` times (backoff of at least 1 s between attempts). If every
+  attempt fails, or the error is not transient (e.g. bad credentials), the server stops accepting
+  connections, waits for in-flight requests, closes the MongoDB pool and exits with code `1`.
+  With the defaults this takes roughly 40–50 s (10 × (3 s server selection + backoff)).
+- Once the indexes exist, a later outage does **not** stop the service: `/products` returns `503` with a `Retry-After: 5` header, while `/items` and
   `/health` keep working. Once MongoDB is back, requests succeed again without restarting.
 - With the defaults, a request during an outage takes about 9 s to fail
   (3 attempts × 3 s server-selection timeout). Lower `MONGO_SERVER_SELECTION_TIMEOUT_MS` or
@@ -171,6 +184,30 @@ Retries are safe because all operations are idempotent:
 
 Internal error details are logged on the server but never sent to the client;
 `500` responses only contain a generic message.
+
+---
+
+## Rate limiting
+
+Every request (including `/health`) goes through a **token bucket per client IP**: each client
+can send up to `RATE_LIMIT_BURST` requests at once, and the bucket refills at
+`RATE_LIMIT_PER_SECOND` tokens per second. Buckets live in memory, per process (with several
+replicas, each one limits independently).
+
+Allowed responses include `X-RateLimit-Limit` and `X-RateLimit-Remaining` headers. When the limit
+is exceeded:
+
+**`429 Too Many Requests`** with headers `Retry-After: <seconds>`, `X-RateLimit-Remaining: 0`
+
+```json
+{ "error": { "code": "RATE_LIMITED", "message": "too many requests, slow down" } }
+```
+
+```sh
+RATE_LIMIT_PER_SECOND=1 RATE_LIMIT_BURST=3 cargo run
+for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{http_code} " http://localhost:3000/health; done
+# 200 200 200 429 429
+```
 
 ---
 
@@ -671,6 +708,7 @@ All errors have the same shape:
 | `400 Bad Request`            | `BAD_REQUEST`         | Invalid id, invalid query params, malformed JSON, missing `Content-Type`. |
 | `404 Not Found`              | `NOT_FOUND`           | No product with that id.                                     |
 | `409 Conflict`               | `CONFLICT`            | Duplicate `sku`.                                             |
+| `429 Too Many Requests`      | `RATE_LIMITED`        | Rate limit exceeded (any route). Includes `Retry-After`.     |
 | `422 Unprocessable Entity`   | `VALIDATION_ERROR`    | Valid JSON with missing/invalid fields.                      |
 | `500 Internal Server Error`  | `INTERNAL_ERROR`      | Unexpected error (details only in server logs).              |
 | `503 Service Unavailable`    | `SERVICE_UNAVAILABLE` | MongoDB unreachable after retries. Includes `Retry-After`.   |

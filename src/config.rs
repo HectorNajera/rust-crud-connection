@@ -12,9 +12,14 @@ pub struct Config {
     pub mongo_connect_timeout: Duration,
     pub mongo_server_selection_timeout: Duration,
     pub op_timeout: Duration,
+    pub mongo_startup_max_attempts: u32,
     pub retry_max_attempts: u32,
     pub retry_base_delay: Duration,
     pub retry_max_delay: Duration,
+    pub rate_limit_enabled: bool,
+    pub rate_limit_per_second: f64,
+    pub rate_limit_burst: u32,
+    pub rate_limit_trust_proxy: bool,
 }
 
 impl Config {
@@ -32,9 +37,14 @@ impl Config {
                 3_000,
             )),
             op_timeout: Duration::from_millis(var("MONGO_OP_TIMEOUT_MS", 5_000)),
+            mongo_startup_max_attempts: var("MONGO_STARTUP_MAX_ATTEMPTS", 10),
             retry_max_attempts: var("RETRY_MAX_ATTEMPTS", 3),
             retry_base_delay: Duration::from_millis(var("RETRY_BASE_DELAY_MS", 100)),
             retry_max_delay: Duration::from_millis(var("RETRY_MAX_DELAY_MS", 2_000)),
+            rate_limit_enabled: var("RATE_LIMIT_ENABLED", true),
+            rate_limit_per_second: var("RATE_LIMIT_PER_SECOND", 10.0),
+            rate_limit_burst: var("RATE_LIMIT_BURST", 20),
+            rate_limit_trust_proxy: var("RATE_LIMIT_TRUST_PROXY", false),
         }
     }
 }
@@ -52,9 +62,14 @@ impl fmt::Debug for Config {
             .field("mongo_connect_timeout", &self.mongo_connect_timeout)
             .field("mongo_server_selection_timeout", &self.mongo_server_selection_timeout)
             .field("op_timeout", &self.op_timeout)
+            .field("mongo_startup_max_attempts", &self.mongo_startup_max_attempts)
             .field("retry_max_attempts", &self.retry_max_attempts)
             .field("retry_base_delay", &self.retry_base_delay)
             .field("retry_max_delay", &self.retry_max_delay)
+            .field("rate_limit_enabled", &self.rate_limit_enabled)
+            .field("rate_limit_per_second", &self.rate_limit_per_second)
+            .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("rate_limit_trust_proxy", &self.rate_limit_trust_proxy)
             .finish()
     }
 }

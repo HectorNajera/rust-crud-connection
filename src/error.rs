@@ -22,6 +22,8 @@ pub enum AppError {
     Unavailable(String),
     /// The operation did not finish within the configured timeout.
     Timeout,
+    /// The client exceeded the rate limit; holds the seconds until it may retry.
+    RateLimited(u64),
     /// The detail is only logged (through `Debug`), never sent to the client.
     Internal(#[allow(dead_code)] String),
 }
@@ -38,6 +40,11 @@ impl AppError {
                 StatusCode::GATEWAY_TIMEOUT,
                 "TIMEOUT",
                 "the database did not respond in time".to_string(),
+            ),
+            Self::RateLimited(_) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                "too many requests, slow down".to_string(),
             ),
             // Internal details are logged, never leaked to the client.
             Self::Internal(_) => (
@@ -57,9 +64,16 @@ impl IntoResponse for AppError {
         }
         let mut res = (status, Json(json!({ "error": { "code": code, "message": message } })))
             .into_response();
-        if matches!(self, Self::Unavailable(_) | Self::Timeout) {
-            res.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        match self {
+            Self::Unavailable(_) | Self::Timeout => {
+                res.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            }
+            Self::RateLimited(secs) => {
+                res.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+            }
+            _ => {}
         }
         res
     }

@@ -40,38 +40,38 @@ pub async fn ping(db: &Database) -> mongodb::error::Result<()> {
     db.run_command(doc! { "ping": 1 }).await.map(|_| ())
 }
 
-/// Creates indexes in the background, retrying until MongoDB is reachable so
-/// the HTTP server can start even if the database is not up yet.
-pub fn ensure_indexes_in_background(db: Database, retry: RetryPolicy) {
-    tokio::spawn(async move {
-        let coll = db.collection::<ProductDoc>(PRODUCTS);
-        let indexes = [
-            IndexModel::builder()
-                .keys(doc! { "sku": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-            IndexModel::builder()
-                .keys(doc! { "category": 1, "created_at": -1 })
-                .build(),
-        ];
-        let mut attempt = 1;
-        loop {
-            match coll.create_indexes(indexes.clone()).await {
-                Ok(_) => {
-                    tracing::info!("mongodb indexes ensured");
-                    return;
-                }
-                Err(err) if !is_transient(&err) => {
-                    tracing::error!(%err, "could not ensure indexes, giving up");
-                    return;
-                }
-                Err(err) => {
-                    let delay = retry.backoff(attempt).max(Duration::from_secs(1));
-                    tracing::warn!(%err, ?delay, "could not ensure indexes, retrying");
-                    tokio::time::sleep(delay).await;
-                    attempt = (attempt + 1).min(10);
-                }
+/// Creates indexes, retrying transient failures up to `max_attempts` times.
+/// Meant to run in the background so the HTTP server can start before MongoDB is up.
+pub async fn ensure_indexes(
+    db: &Database,
+    retry: &RetryPolicy,
+    max_attempts: u32,
+) -> mongodb::error::Result<()> {
+    let coll = db.collection::<ProductDoc>(PRODUCTS);
+    let indexes = [
+        IndexModel::builder()
+            .keys(doc! { "sku": 1 })
+            .options(IndexOptions::builder().unique(true).build())
+            .build(),
+        IndexModel::builder()
+            .keys(doc! { "category": 1, "created_at": -1 })
+            .build(),
+    ];
+    let max_attempts = max_attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        match coll.create_indexes(indexes.clone()).await {
+            Ok(_) => {
+                tracing::info!("mongodb indexes ensured");
+                return Ok(());
+            }
+            Err(err) if !is_transient(&err) || attempt >= max_attempts => return Err(err),
+            Err(err) => {
+                let delay = retry.backoff(attempt).max(Duration::from_secs(1));
+                tracing::warn!(%err, attempt, max_attempts, ?delay, "could not ensure indexes, retrying");
+                tokio::time::sleep(delay).await;
+                attempt += 1;
             }
         }
-    });
+    }
 }
